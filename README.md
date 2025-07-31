@@ -1,0 +1,1 @@
+A small program that uses media pipe pose detection to detect if a user is in the "up" or "down" position of a deadlift in real time. models are trained off the following dataset: https://www.kaggle.com/datasets/venkatagandreti/deadlift-coordinates-up-and-down-positions?resource=download
