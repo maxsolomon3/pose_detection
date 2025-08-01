@@ -1,70 +1,130 @@
-#imports
+import sys
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
-import matplotlib.pyplot as plt
 import pandas as pd
 import pickle
 
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QHBoxLayout
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QThread, pyqtSignal
 
-
-print('Press q to stop webcam recording')
-
-#load model
+# Load the model
 with open('deadlift.pkl', 'rb') as f:
     model = pickle.load(f)
 
-#set video capture device (using webcam)
-capture = cv.VideoCapture(0)
+# Mediapipe setup
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
 
-#setup mediapipe feed
-with mp_pose.Pose(min_detection_confidence = 0.7, min_tracking_confidence = 0.7) as pose:
-    while(capture.isOpened):
-        ret, frame = capture.read()
+class VideoThread(QThread):
+    change_pixmap_signal = pyqtSignal(QImage)
+    class_signal = pyqtSignal(str)
+    prob_signal = pyqtSignal(float)
 
-        frame = cv.flip(frame,1)
+    def run(self):
+        capture = cv.VideoCapture(0)
+        with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
+            while capture.isOpened():
+                ret, frame = capture.read()
+                if not ret:
+                    break
 
-        #Recolor image for media pipe
-        image = cv.cvtColor(frame,cv.COLOR_BGR2RGB)
-        image.flags.writeable = False
-        
-        #Detect pose
-        result = pose.process(image)
-        
-        image.flags.writeable = True
-        #Recolor image for display
-        image = cv.cvtColor(image, cv.COLOR_RGB2BGR)
-        
+                frame = cv.flip(frame, 1)
+                image = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+                image.flags.writeable = False
+                result = pose.process(image)
+                image.flags.writeable = True
+                image = cv.cvtColor(image, cv.COLOR_RGB2BGR)
 
-        #Render detections
-        mp_drawing.draw_landmarks(image, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                if result.pose_landmarks:
+                    mp_drawing.draw_landmarks(image, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-        try:
-            row = np.array([[r.x, r.y, r.z, r.visibility] for r in result.pose_landmarks.landmark]).flatten()
-            X = pd.DataFrame([row])
-            body_langugage_class = model.predict(X)[0]
-            body_langugage_prob = model.predict_proba(X)[0]
+                    try:
+                        row = np.array([[r.x, r.y, r.z, r.visibility] for r in result.pose_landmarks.landmark]).flatten()
+                        X = pd.DataFrame([row])
+                        body_lang_class = model.predict(X)[0]
+                        body_lang_prob = model.predict_proba(X)[0]
+                        prob_val = round(body_lang_prob[np.argmax(body_lang_prob)], 2)
 
-            # Draw background rectangle
-            cv.rectangle(image, (0,0), (300,80), (245,117,16), -1)
+                        # Emit signals to GUI
+                        self.class_signal.emit(body_lang_class)
+                        self.prob_signal.emit(prob_val)
+                    except Exception as e:
+                        print(f"Prediction error: {e}")
 
-            # Draw 'CLASS' label and value
-            cv.putText(image, 'CLASS', (15,20), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv.LINE_AA)
-            cv.putText(image, body_langugage_class.split(' ')[0], (90,20), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv.LINE_AA)
+                rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                bytes_per_line = ch * w
+                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                self.change_pixmap_signal.emit(qt_image.scaled(640, 480))
 
-            # Draw 'PROB' label and value
-            cv.putText(image, 'PROB', (15,60), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv.LINE_AA)
-            cv.putText(image, str(round(body_langugage_prob[np.argmax(body_langugage_prob)],2)), (90,60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv.LINE_AA)
-            
+        capture.release()
 
-        except Exception as e:
-            print(f"Exception: {e}")
+class App(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Deadlift Pose Estimator")
 
-        cv.imshow('Mediapipe Feed', image)
+        # Video feed
+        self.image_label = QLabel(self)
+        self.image_label.resize(640, 480)
 
-        if cv.waitKey(10) & 0xFF == ord('q'):
-            break
-capture.release()
-cv.destroyAllWindows()
+        # Classification output labels
+        self.class_label = QLabel("Class: ---")
+        self.prob_label = QLabel("Probability: ---")
+
+        # Layout
+        vbox = QVBoxLayout()
+        vbox.addWidget(self.image_label)
+
+        hbox = QHBoxLayout()
+        hbox.addWidget(self.class_label)
+        hbox.addWidget(self.prob_label)
+        vbox.addLayout(hbox)
+
+        self.setLayout(vbox)
+
+        # Start video thread
+        self.thread = VideoThread()
+        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.class_signal.connect(self.update_class_label)
+        self.thread.prob_signal.connect(self.update_prob_label)
+        self.thread.start()
+
+    def update_image(self, qt_img):
+        self.image_label.setPixmap(QPixmap.fromImage(qt_img))
+
+    def update_class_label(self, class_text):
+        # Decide arrow direction
+        if 'correct' in class_text.lower() or 'up' in class_text.lower():
+            arrow = '\u25B2'  # ▲ Up arrow
+        elif 'incorrect' in class_text.lower() or 'down' in class_text.lower():
+            arrow = '\u25BC'  # ▼ Down arrow
+        else:
+            arrow = ''  # No arrow if neutral
+
+        self.class_label.setText(f"Class: {class_text} {arrow}")
+
+    def update_prob_label(self, prob_val):
+        self.prob_label.setText(f"Probability: {prob_val}")
+
+        # Change color based on range
+        if prob_val <= 0.5:
+            color = "red"
+        elif prob_val <= 0.8:
+            color = "orange"
+        else:
+            color = "green"
+
+        self.prob_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def closeEvent(self, event):
+        self.thread.terminate()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = App()
+    window.show()
+    sys.exit(app.exec_())
