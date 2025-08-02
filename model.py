@@ -19,7 +19,7 @@ X = df.drop('class', axis= 1)
 y = df['class']
 
 
-X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.3,random_state=1050)
+X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.5,random_state=1050)
 
 
 

@@ -5,7 +5,7 @@ import mediapipe as mp
 import pandas as pd
 import pickle
 
-from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QHBoxLayout
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QFormLayout
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -21,10 +21,14 @@ class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(QImage)
     class_signal = pyqtSignal(str)
     prob_signal = pyqtSignal(float)
+    rep_signal = pyqtSignal(int)
 
     def run(self):
+        self.reps = 0
+        self.rep_state = None  # 'up' or 'down'
+
         capture = cv.VideoCapture(0)
-        with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
+        with mp_pose.Pose(min_detection_confidence=0.8, min_tracking_confidence=0.8) as pose:
             while capture.isOpened():
                 ret, frame = capture.read()
                 if not ret:
@@ -53,6 +57,15 @@ class VideoThread(QThread):
                     except Exception as e:
                         print(f"Prediction error: {e}")
 
+                    # Rep counting logic (prob value used for smoothing between reps)
+                    if body_lang_class == "up" and prob_val > 0.7:
+                        if self.rep_state == "down":
+                            self.reps += 1
+                            self.rep_signal.emit(self.reps)
+                        self.rep_state = "up"
+                    else:
+                        self.rep_state = "down"
+
                 rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
@@ -66,7 +79,7 @@ class App(QWidget):
         super().__init__()
         self.setWindowTitle("Deadlift Pose Estimator")
 
-        # Video feed
+        # Video feed display
         self.image_label = QLabel(self)
         self.image_label.resize(640, 480)
 
@@ -74,14 +87,34 @@ class App(QWidget):
         self.class_label = QLabel("Class: ---")
         self.prob_label = QLabel("Probability: ---")
 
-        # Layout
+        # Repetition counter
+        self.rep_label = QLabel("Reps: 0")
+        self.rep_count = 0
+
+        # Weight input field
+        self.weight_input = QLineEdit()
+        self.weight_input.setPlaceholderText("e.g. 135")
+
+        # Layouts
         vbox = QVBoxLayout()
+
+        # Top-right layout for reps and weight input
+        top_right_layout = QHBoxLayout()
+        top_right_layout.addWidget(self.rep_label)
+
+        weight_form = QFormLayout()
+        weight_form.addRow("Weight (lbs):", self.weight_input)
+        top_right_layout.addLayout(weight_form)
+        top_right_layout.addStretch()  # Push to top-right
+
+        vbox.addLayout(top_right_layout)
         vbox.addWidget(self.image_label)
 
-        hbox = QHBoxLayout()
-        hbox.addWidget(self.class_label)
-        hbox.addWidget(self.prob_label)
-        vbox.addLayout(hbox)
+        # Bottom layout for class and prob
+        bottom_hbox = QHBoxLayout()
+        bottom_hbox.addWidget(self.class_label)
+        bottom_hbox.addWidget(self.prob_label)
+        vbox.addLayout(bottom_hbox)
 
         self.setLayout(vbox)
 
@@ -90,34 +123,34 @@ class App(QWidget):
         self.thread.change_pixmap_signal.connect(self.update_image)
         self.thread.class_signal.connect(self.update_class_label)
         self.thread.prob_signal.connect(self.update_prob_label)
+        self.thread.rep_signal.connect(self.update_rep_label)
         self.thread.start()
 
     def update_image(self, qt_img):
         self.image_label.setPixmap(QPixmap.fromImage(qt_img))
 
     def update_class_label(self, class_text):
-        # Decide arrow direction
         if 'correct' in class_text.lower() or 'up' in class_text.lower():
-            arrow = '\u25B2'  # ▲ Up arrow
+            arrow = '\u25B2'  # ▲ Up
         elif 'incorrect' in class_text.lower() or 'down' in class_text.lower():
-            arrow = '\u25BC'  # ▼ Down arrow
+            arrow = '\u25BC'  # ▼ Down
         else:
-            arrow = ''  # No arrow if neutral
-
+            arrow = ''
         self.class_label.setText(f"Class: {class_text} {arrow}")
 
     def update_prob_label(self, prob_val):
         self.prob_label.setText(f"Probability: {prob_val}")
-
-        # Change color based on range
         if prob_val <= 0.5:
             color = "red"
         elif prob_val <= 0.8:
             color = "orange"
         else:
             color = "green"
-
         self.prob_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def update_rep_label(self, count):
+        self.rep_count = count
+        self.rep_label.setText(f"Reps: {count}")
 
     def closeEvent(self, event):
         self.thread.terminate()
