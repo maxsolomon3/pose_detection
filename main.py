@@ -7,11 +7,12 @@ import pickle
 import csv
 from datetime import datetime
 
-from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QFormLayout, QPushButton,QMessageBox
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QFormLayout, QPushButton, QMessageBox
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
 
 #Load the model
 with open('deadlift.pkl', 'rb') as f:
@@ -27,59 +28,88 @@ class VideoThread(QThread):
     prob_signal = pyqtSignal(float)
     rep_signal = pyqtSignal(int)
 
+    def __init__(self):
+        super().__init__()
+        self._stop_requested = False
+
+    def requestInterruption(self):
+        self._stop_requested = True
+        super().requestInterruption()
+
     def run(self):
         self.reps = 0
         self.rep_state = None  #'up' or 'down'
 
-        #Setup capture
         capture = cv.VideoCapture(0, cv.CAP_DSHOW)
-        with mp_pose.Pose(min_detection_confidence=0.8, min_tracking_confidence=0.8) as pose:
-            while not self.isInterruptionRequested() and capture.isOpened():
-                ret, frame = capture.read()
-                if not ret:
-                    break
-                #Image pre-processing
-                frame = cv.flip(frame, 1)
-                image = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-                image.flags.writeable = False
-                result = pose.process(image)
-                image.flags.writeable = True
-                image = cv.cvtColor(image, cv.COLOR_RGB2BGR)
+        if not capture.isOpened():
+            print("Error: Webcam could not be opened.")
+            return
 
-                if result.pose_landmarks:
-                    mp_drawing.draw_landmarks(image, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+        try:
+            with mp_pose.Pose(min_detection_confidence=0.8, min_tracking_confidence=0.8) as pose:
+                while not self.isInterruptionRequested() and not self._stop_requested and capture.isOpened():
+                    ret, frame = capture.read()
+                    if not ret:
+                        print("Warning: Failed to grab frame")
+                        break
+
+                    if self.isInterruptionRequested() or self._stop_requested:
+                        break
+
+                    frame = cv.flip(frame, 1)
+                    image = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+                    image.flags.writeable = False
 
                     try:
-                        #Prediction
-                        row = np.array([[r.x, r.y, r.z, r.visibility] for r in result.pose_landmarks.landmark]).flatten()
-                        X = pd.DataFrame([row])
-                        body_lang_class = model.predict(X)[0]
-                        body_lang_prob = model.predict_proba(X)[0]
-                        prob_val = round(body_lang_prob[np.argmax(body_lang_prob)], 2)
-
-                        #Emit signals to GUI
-                        self.class_signal.emit(body_lang_class)
-                        self.prob_signal.emit(prob_val)
+                        result = pose.process(image)
                     except Exception as e:
-                        print(f"Prediction error: {e}")
+                        print(f"Mediapipe processing error: {e}")
+                        continue  #skip this frame but keep running
 
-                    #Rep counting logic (prob value used for smoothing between reps)
-                    if body_lang_class == "up" and prob_val > 0.7:
-                        if self.rep_state == "down":
-                            self.reps += 1
-                            self.rep_signal.emit(self.reps)
-                        self.rep_state = "up"
-                    else:
-                        self.rep_state = "down"
+                    image.flags.writeable = True
+                    image = cv.cvtColor(image, cv.COLOR_RGB2BGR)
 
-                rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                #Emit image to GUI
-                self.change_pixmap_signal.emit(qt_image.scaled(640, 480))
+                    if self.isInterruptionRequested() or self._stop_requested:
+                        break
 
-        capture.release()
+                    if result.pose_landmarks:
+                        try:
+                            mp_drawing.draw_landmarks(image, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                        except Exception as e:
+                            print(f"Drawing error: {e}")
+
+                        try:
+                            row = np.array([[r.x, r.y, r.z, r.visibility] for r in result.pose_landmarks.landmark]).flatten()
+                            X = pd.DataFrame([row])
+                            body_lang_class = model.predict(X)[0]
+                            body_lang_prob = model.predict_proba(X)[0]
+                            prob_val = round(body_lang_prob[np.argmax(body_lang_prob)], 2)
+
+                            self.class_signal.emit(body_lang_class)
+                            self.prob_signal.emit(prob_val)
+
+                            if body_lang_class == "up" and prob_val > 0.7:
+                                if self.rep_state == "down":
+                                    self.reps += 1
+                                    self.rep_signal.emit(self.reps)
+                                self.rep_state = "up"
+                            else:
+                                self.rep_state = "down"
+
+                        except Exception as e:
+                            print(f"Prediction or rep counting error: {e}")
+
+                    rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+                    h, w, ch = rgb_image.shape
+                    bytes_per_line = ch * w
+                    qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                    self.change_pixmap_signal.emit(qt_image.scaled(640, 480))
+
+                    self.msleep(10)  #Small sleep for smooth interruption
+
+        finally:
+            capture.release()
+
 
 class App(QWidget):
     def __init__(self):
@@ -103,7 +133,7 @@ class App(QWidget):
         #Weight input field
         self.weight_input = QLineEdit()
         self.weight_input.setPlaceholderText("e.g. 135")
-        
+
         #Log Button
         self.log_button = QPushButton("Log")
         self.log_button.clicked.connect(self.log_session)
@@ -132,7 +162,7 @@ class App(QWidget):
 
         self.setLayout(vbox)
 
-        #Setup video threads
+        #Setup video thread
         self.thread = VideoThread()
         self.thread.change_pixmap_signal.connect(self.update_image)
         self.thread.class_signal.connect(self.update_class_label)
@@ -148,43 +178,32 @@ class App(QWidget):
         self.ax = self.canvas.figure.add_subplot(111)
         self.canvas.hide()
         vbox.addWidget(self.canvas)
+
         self.thread.start()
 
-    #Toggles between Camera view and Graph view
     def toggle_view(self):
         self.toggle_button.setEnabled(False)
 
-        def start_video_thread():
-            self.thread = VideoThread()
-            self.thread.change_pixmap_signal.connect(self.update_image)
-            self.thread.class_signal.connect(self.update_class_label)
-            self.thread.prob_signal.connect(self.update_prob_label)
-            self.thread.rep_signal.connect(self.update_rep_label)
-            self.thread.start()
-            self.toggle_button.setEnabled(True)
-
         if self.canvas.isVisible():
-            #Switch to webcam
+            #Switch to webcam view
+
             self.canvas.hide()
             self.image_label.show()
 
             if self.thread is not None:
                 self.thread.requestInterruption()
-                self.thread.finished.connect(lambda: QTimer.singleShot(300, start_video_thread))
                 self.thread.wait()
-                self.thread.deleteLater()
                 self.thread = None
-            else:
-                QTimer.singleShot(300, start_video_thread)
 
+            self.start_video_thread()
             self.toggle_button.setText("Show Graph")
 
         else:
-            #Switch to graph 
+            #Switch to graph view
+
             if self.thread is not None:
                 self.thread.requestInterruption()
                 self.thread.wait()
-                self.thread.deleteLater()
                 self.thread = None
 
             self.image_label.hide()
@@ -192,6 +211,15 @@ class App(QWidget):
             self.plot_1rm_graph()
             self.toggle_button.setText("Show Camera")
             self.toggle_button.setEnabled(True)
+
+    def start_video_thread(self):
+        self.thread = VideoThread()
+        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.class_signal.connect(self.update_class_label)
+        self.thread.prob_signal.connect(self.update_prob_label)
+        self.thread.rep_signal.connect(self.update_rep_label)
+        self.thread.start()
+        self.toggle_button.setEnabled(True)
 
     def plot_1rm_graph(self):
         try:
@@ -209,16 +237,15 @@ class App(QWidget):
             self.canvas.draw()
         except Exception as e:
             QMessageBox.critical(self, "Plot Error", f"Failed to read or plot data:\n{e}")
-        
 
     def update_image(self, qt_img):
         self.image_label.setPixmap(QPixmap.fromImage(qt_img))
 
     def update_class_label(self, class_text):
         if 'correct' in class_text.lower() or 'up' in class_text.lower():
-            arrow = '\u25B2'  # ▲ Up
+            arrow = '\u25B2'  #▲ Up
         elif 'incorrect' in class_text.lower() or 'down' in class_text.lower():
-            arrow = '\u25BC'  # ▼ Down
+            arrow = '\u25BC'  #▼ Down
         else:
             arrow = ''
         self.class_label.setText(f"Class: {class_text} {arrow}")
@@ -238,9 +265,11 @@ class App(QWidget):
         self.rep_label.setText(f"Reps: {count}")
 
     def closeEvent(self, event):
-        self.thread.requestInterruption()
-        self.thread.wait()  #Waits for thread to stop cleanly
+        if self.thread is not None:
+            self.thread.requestInterruption()
+            self.thread.wait()
         event.accept()
+
     def log_session(self):
         weight = self.weight_input.text().strip()
         reps = self.rep_count
@@ -255,7 +284,6 @@ class App(QWidget):
         try:
             with open("log.csv", mode="a", newline="") as file:
                 writer = csv.writer(file)
-                #Write header only if file is empty
                 if file.tell() == 0:
                     writer.writerow(["Weight (lbs)", "Reps", "DateTime"])
                 writer.writerow(row)
@@ -263,7 +291,6 @@ class App(QWidget):
             QMessageBox.information(self, "Logged", "Session logged successfully.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to log session: {e}")
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
